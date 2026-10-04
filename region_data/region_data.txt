@@ -1,0 +1,16 @@
+// Frame 320x240 px. Paste this over the ROI block in the sketch.
+static const int16_t ROI_0_PTS[] = {117,110, 120,42, 151,43, 160,111};
+static const int16_t ROI_1_PTS[] = {122,149, 120,186, 2,190, 3,156};
+static const int16_t ROI_2_PTS[] = {187,149, 182,104, 257,102, 269,147};
+static const Roi ROIS[] = {
+    {"ROI 3", ROI_2_PTS, 4},
+    {"ROI 1", ROI_0_PTS, 4},
+    {"ROI 2", ROI_1_PTS, 4},
+};
+
+
+//Car size
+static const int16_t ROI_3_PTS[] = {151,124, 177,124, 177,154, 151,154};
+static const Roi ROIS[] = {
+    {"ROI 4", ROI_3_PTS, 4},
+};
