@@ -1,6 +1,0 @@
-{
-  // This workspace contains Arduino sketches, not a standalone C/C++ project.
-  // Let the Arduino extension provide its compiler context instead of starting
-  // cpptools' IntelliSense engine without the ESP32/Edge Impulse include paths.
-  "C_Cpp.intelliSenseEngine": "disabled"
-}

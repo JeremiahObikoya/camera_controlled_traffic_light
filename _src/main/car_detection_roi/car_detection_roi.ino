@@ -48,10 +48,29 @@ static float g_threshold = 0.55f;
 #define EI_CAMERA_FRAME_BYTE_SIZE                 3
 
 #define JPG_MAX_BYTES     (32 * 1024)
-#define MAX_BOXES         10
+#define MAX_BOXES         20    // raised from 10: splitting merged detections can produce more boxes
 #define MAX_ROIS          8
 #define LOG_LINES         40
 #define LOG_LINE_LEN      96
+
+// ---------------------------------------------------------------------------
+// Maximum bounding-box for a single car.
+// Measured from CAR_Size_PTS at the worst-case (diagonal) pose:
+//   width  = 177 - 151 = 26 px
+//   height = 154 - 124 = 30 px   →  area = 780 px²
+// A 25 % tolerance is added for slight angles and lens distortion.
+// Boxes whose area exceeds MAX_CAR_BOX_AREA are treated as merged detections
+// and are split into virtual sub-detections for ROI counting.
+// ---------------------------------------------------------------------------
+#define MAX_CAR_BOX_W     26          // pixels
+#define MAX_CAR_BOX_H     30          // pixels
+#define MAX_CAR_BOX_AREA  975         // 780 * 1.25  (int32 arithmetic, safe)
+#define MAX_CAR_SPLIT     4           // maximum cars to extract from one merged box
+
+// Global flag: show oversized (likely merged) boxes on the web interface.
+// They are ALWAYS excluded from the vehicle count regardless of this flag.
+// Toggle live with  GET /set?oversized=1  or  GET /set?oversized=0
+static bool g_show_oversized = false;
 
 // ---------------------------------------------------------------------------
 // REGIONS OF INTEREST (frame pixels, 320x240)
@@ -137,6 +156,8 @@ struct Box {
     int16_t  x, y, w, h;      // frame coordinates (320x240)
     int16_t  ax, ay;          // anchor point used for the ROI test
     uint8_t  mask;            // bit i set = inside ROI i
+    bool     oversized;       // true → box area exceeds MAX_CAR_BOX_AREA (merged/noise)
+    uint8_t  split_n;         // how many virtual cars were extracted (1 = normal)
 };
 static Box      g_boxes[MAX_BOXES];
 static uint8_t  g_box_count = 0;
@@ -324,21 +345,25 @@ pre{background:#000;color:#8f8;padding:6px;height:220px;overflow:auto;font-size:
 small{color:#999}
 #dot{display:inline-block;width:12px;height:12px;border-radius:50%;background:#c00;margin-right:6px;vertical-align:middle}
 #ctl{font-size:14px;color:#ddd}
-#modeButton{margin:8px 0;padding:10px 14px;font-size:15px;border-radius:6px;border:1px solid #555;background:#333;color:#fff}
+#modeButton{margin:8px 4px 8px 0;padding:10px 14px;font-size:15px;border-radius:6px;border:1px solid #555;background:#333;color:#fff}
+#ovButton{margin:8px 0;padding:10px 14px;font-size:15px;border-radius:6px;border:1px solid #555;background:#333;color:#f90}
 </style></head><body>
 <canvas id="c" width="320" height="240"></canvas>
 <div><small id="info">waiting...</small></div>
 <div style="margin-top:6px"><span id="dot"></span><span id="ctl">Traffic controller: checking...</span></div>
 <button id="modeButton" onclick="toggleMode()">Control mode: ...</button>
+<button id="ovButton"   onclick="toggleOversized()">Show oversized: OFF</button>
 <div>Min confidence: <input id="th" type="range" min="0" max="0.99" step="0.01" value="0">
 <span id="thv">0.00</span></div>
-<small>Blue = regions. Green box = inside a region. Grey box = outside all regions. Dot = point tested. Tap image for x,y.</small>
+<small>Blue = regions. Green = valid car inside ROI. Grey = valid car outside ROI. <span style="color:#f90">Orange = oversized/merged (excluded from count)</span>. Tap image for x,y.</small>
 <div><small id="click"></small></div>
 <pre id="log"></pre>
 <script>
 var cv=document.getElementById('c'),ctx=cv.getContext('2d'),img=new Image(),seq=-1,rois=[],first=true,curMode='camera';
 var th=document.getElementById('th'),thv=document.getElementById('thv');
 var modeButton=document.getElementById('modeButton');
+var ovButton=document.getElementById('ovButton');
+var showOversized=false;
 th.onchange=function(){fetch('/set?th='+th.value).catch(function(){});};
 th.oninput=function(){thv.textContent=parseFloat(th.value).toFixed(2);};
 function setStatus(s){
@@ -348,11 +373,21 @@ function setStatus(s){
   ?'Traffic controller CONNECTED - green lane: '+(s.lane||'?')+' - controller using: '+s.cmode.toUpperCase()
   :'Traffic controller NOT CONNECTED';
  modeButton.textContent='Control mode: '+s.mode.toUpperCase()+'  (tap to switch to '+(s.mode==='camera'?'TIME':'CAMERA')+')';
+ // Sync oversized toggle from server state (survives page reload)
+ if(typeof s.showov!=='undefined'){
+  showOversized=(s.showov===1);
+  ovButton.textContent='Show oversized: '+(showOversized?'ON':'OFF');
+ }
 }
 function refreshStatus(){fetch('/state').then(function(r){return r.json();}).then(setStatus).catch(function(){});}
 function toggleMode(){
  var next=curMode==='camera'?'time':'camera';
  fetch('/mode?value='+next).then(refreshStatus).catch(function(){});
+}
+function toggleOversized(){
+ showOversized=!showOversized;
+ ovButton.textContent='Show oversized: '+(showOversized?'ON':'OFF');
+ fetch('/set?oversized='+(showOversized?'1':'0')).catch(function(){});
 }
 cv.onclick=function(e){var r=cv.getBoundingClientRect();
  var x=Math.round((e.clientX-r.left)*cv.width/r.width),y=Math.round((e.clientY-r.top)*cv.height/r.height);
@@ -369,8 +404,12 @@ function draw(s){
   ctx.fillText(r.n+': '+(s.c[i]||0),r.p[0]+4,r.p[1]>14?r.p[1]-4:r.p[1]+14);
  });
  (s.b||[]).forEach(function(b){
-  var inside=b[6]!==0;
-  ctx.strokeStyle=inside?'#0f0':'#999';ctx.fillStyle=ctx.strokeStyle;
+  var oversized=(b[9]===1);
+  if(oversized&&!showOversized){return;}   // hide oversized boxes unless toggle is ON
+  var inside=(b[6]!==0)&&!oversized;
+  // Green = valid & inside ROI, Grey = valid & outside, Orange = oversized/merged
+  ctx.strokeStyle=oversized?'#f90':(inside?'#0f0':'#999');
+  ctx.fillStyle=ctx.strokeStyle;
   ctx.strokeRect(b[2],b[3],b[4],b[5]);
   ctx.fillText(b[0]+' '+b[1].toFixed(2),b[2]+2,b[3]>12?b[3]-3:b[3]+12);
   ctx.beginPath();ctx.arc(b[7],b[8],3,0,6.3);ctx.fill();
@@ -434,21 +473,24 @@ static void handle_state() {
     size_t n = 0;
     n += snprintf(buf + n, sizeof(buf) - n,
         "{\"seq\":%lu,\"dsp\":%lu,\"cls\":%lu,\"iw\":%d,\"ih\":%d,\"th\":%.2f,"
-        "\"ctl\":%d,\"lane\":%d,\"cmode\":\"%s\",\"mode\":\"%s\",\"c\":[",
+        "\"ctl\":%d,\"lane\":%d,\"cmode\":\"%s\",\"mode\":\"%s\","
+        "\"showov\":%d,\"c\":[",
         (unsigned long)g_seq, (unsigned long)g_dsp_ms, (unsigned long)g_cls_ms,
         EI_CLASSIFIER_INPUT_WIDTH, EI_CLASSIFIER_INPUT_HEIGHT, g_threshold,
         g_ctrl_up ? 1 : 0, g_ctrl_lane,
         g_ctrl_mode_camera ? "camera" : "time",
-        g_camera_control_mode ? "camera" : "time");
+        g_camera_control_mode ? "camera" : "time",
+        g_show_oversized ? 1 : 0);
     for (size_t r = 0; r < ROI_COUNT; r++) {
         n += snprintf(buf + n, sizeof(buf) - n, "%s%u", r ? "," : "", (unsigned)g_roi_count[r]);
     }
     n += snprintf(buf + n, sizeof(buf) - n, "],\"b\":[");
-    for (uint8_t i = 0; i < g_box_count && n < sizeof(buf) - 120; i++) {
+    for (uint8_t i = 0; i < g_box_count && n < sizeof(buf) - 130; i++) {
         const Box &b = g_boxes[i];
-        n += snprintf(buf + n, sizeof(buf) - n, "%s[\"%s\",%.3f,%d,%d,%d,%d,%u,%d,%d]",
+        // Box JSON: [label, conf, x, y, w, h, mask, ax, ay, oversized]
+        n += snprintf(buf + n, sizeof(buf) - n, "%s[\"%s\",%.3f,%d,%d,%d,%d,%u,%d,%d,%d]",
                       i ? "," : "", b.label, b.value, b.x, b.y, b.w, b.h,
-                      (unsigned)b.mask, b.ax, b.ay);
+                      (unsigned)b.mask, b.ax, b.ay, b.oversized ? 1 : 0);
     }
     snprintf(buf + n, sizeof(buf) - n, "]}");
     server.sendHeader("Cache-Control", "no-store");
@@ -500,6 +542,11 @@ static void handle_set() {
             g_threshold = v;
             dbg_printf("Threshold set to %.2f", v);
         }
+    }
+    if (server.hasArg("oversized")) {
+        String ov = server.arg("oversized");
+        g_show_oversized = (ov == "1" || ov == "true");
+        dbg_printf("Show oversized boxes: %s", g_show_oversized ? "ON" : "OFF");
     }
     server.send(200, "text/plain", "ok");
 }
@@ -624,41 +671,101 @@ void loop()
             continue;
         }
         dbg_printf("  %s (%f) [ x: %u, y: %u, width: %u, height: %u ]",
-                   bb.label,
-                   bb.value,
-                   (unsigned)bb.x,
-                   (unsigned)bb.y,
-                   (unsigned)bb.width,
-                   (unsigned)bb.height);
+                   bb.label, bb.value,
+                   (unsigned)bb.x, (unsigned)bb.y,
+                   (unsigned)bb.width, (unsigned)bb.height);
 
-        // --- ROI test (in 320x240 frame coordinates) ---
+        // Map model coordinates → 320x240 frame coordinates
         int x, y, w, h;
         map_box_to_frame(bb, x, y, w, h);
-        int ax = x + w / 2;
-#if ROI_ANCHOR_BOTTOM_CENTER
-        int ay = y + h;
-#else
-        int ay = y + h / 2;
-#endif
-        ax = constrain(ax, 0, EI_CAMERA_RAW_FRAME_BUFFER_COLS - 1);
-        ay = constrain(ay, 0, EI_CAMERA_RAW_FRAME_BUFFER_ROWS - 1);
 
-        uint8_t mask = 0;
-        for (size_t r = 0; r < ROI_COUNT; r++) {
-            if (point_in_poly(ax, ay, ROIS[r].pts, ROIS[r].n)) {
-                mask |= (1 << r);
-                g_roi_count[r]++;
-                frame_conf_sum[r] += bb.value;
+        // Display anchor (centre dot shown on the web page for the original box)
+        int disp_ax = x + w / 2;
+#if ROI_ANCHOR_BOTTOM_CENTER
+        int disp_ay = y + h;
+#else
+        int disp_ay = y + h / 2;
+#endif
+        disp_ax = constrain(disp_ax, 0, EI_CAMERA_RAW_FRAME_BUFFER_COLS - 1);
+        disp_ay = constrain(disp_ay, 0, EI_CAMERA_RAW_FRAME_BUFFER_ROWS - 1);
+
+        // ----------------------------------------------------------------
+        // Oversized / merged-car detection
+        // Boxes whose area exceeds MAX_CAR_BOX_AREA are treated as
+        // containing multiple cars placed close together.  We split the
+        // box into splitN equal slices along the longer axis and test each
+        // slice anchor against the ROIs independently.
+        // ----------------------------------------------------------------
+        int32_t boxArea = (int32_t)w * h;
+        bool oversized  = (boxArea > MAX_CAR_BOX_AREA);
+        int  splitN     = 1;
+        if (oversized) {
+            splitN = (int)((float)boxArea / MAX_CAR_BOX_AREA + 0.5f);
+            if (splitN < 2)          splitN = 2;
+            if (splitN > MAX_CAR_SPLIT) splitN = MAX_CAR_SPLIT;
+            dbg_printf("  ^ oversized (area=%ld px2) → splitting into %d virtual cars",
+                       (long)boxArea, splitN);
+        }
+
+        // ----------------------------------------------------------------
+        // ROI test: iterate through each virtual sub-box
+        // ----------------------------------------------------------------
+        uint8_t totalMask = 0;
+        for (int s = 0; s < splitN; s++) {
+            int sub_ax, sub_ay;
+            if (splitN == 1) {
+                // Normal single-car box — use the pre-computed display anchor
+                sub_ax = disp_ax;
+                sub_ay = disp_ay;
+            } else {
+                // Split along the longer dimension so each slice covers one car
+                int sub_x, sub_y, sub_w, sub_h;
+                if (w >= h) {                        // wider than tall → horizontal split
+                    sub_w = w / splitN;  sub_h = h;
+                    sub_x = x + s * sub_w;  sub_y = y;
+                } else {                             // taller than wide → vertical split
+                    sub_w = w;  sub_h = h / splitN;
+                    sub_x = x;  sub_y = y + s * sub_h;
+                }
+                sub_ax = sub_x + sub_w / 2;
+#if ROI_ANCHOR_BOTTOM_CENTER
+                sub_ay = sub_y + sub_h;
+#else
+                sub_ay = sub_y + sub_h / 2;
+#endif
+                sub_ax = constrain(sub_ax, 0, EI_CAMERA_RAW_FRAME_BUFFER_COLS - 1);
+                sub_ay = constrain(sub_ay, 0, EI_CAMERA_RAW_FRAME_BUFFER_ROWS - 1);
+            }
+
+            for (size_t r = 0; r < ROI_COUNT; r++) {
+                if (point_in_poly(sub_ax, sub_ay, ROIS[r].pts, ROIS[r].n)) {
+                    totalMask |= (1 << r);
+                    g_roi_count[r]++;
+                    frame_conf_sum[r] += bb.value;
+                }
             }
         }
 
-        if (g_box_count < MAX_BOXES) {
+        // ----------------------------------------------------------------
+        // Store for web display
+        //   • Normal boxes  → always stored; green if inside ROI, grey if not.
+        //   • Oversized boxes → only stored when g_show_oversized == true;
+        //     always coloured orange regardless of ROI; mask forced to 0 so
+        //     they are never misread as valid single-car detections.
+        //     The label gets a ×N suffix to show the split count.
+        // ----------------------------------------------------------------
+        if ((!oversized || g_show_oversized) && g_box_count < MAX_BOXES) {
             Box &b = g_boxes[g_box_count++];
-            strlcpy(b.label, bb.label, sizeof(b.label));
-            b.value = bb.value;
-            b.x = x; b.y = y; b.w = w; b.h = h;
-            b.ax = ax; b.ay = ay;
-            b.mask = mask;
+            if (oversized && splitN > 1)
+                snprintf(b.label, sizeof(b.label), "%s*%d", bb.label, splitN);
+            else
+                strlcpy(b.label, bb.label, sizeof(b.label));
+            b.value    = bb.value;
+            b.x = x;  b.y = y;  b.w = w;  b.h = h;
+            b.ax = disp_ax;  b.ay = disp_ay;
+            b.mask     = oversized ? 0 : totalMask;  // oversized: never show as "inside"
+            b.oversized = oversized;
+            b.split_n   = (uint8_t)splitN;
         }
     }
 
