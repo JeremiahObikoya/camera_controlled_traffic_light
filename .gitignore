@@ -1,0 +1,45 @@
+# Compiled Object files, ELF, BIN, HEX
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.hex
+*.bin
+*.elf
+
+# Arduino build output & temp files
+build/
+*.app.d
+*.d
+*.dump
+sketch/
+
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+.clang_complete
+.gcc-flags.json
+
+# IDE / Editor folders
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.bak
+
+# OS generated files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# Secrets & Environment variables
+credentials.h
+secrets.h
+config.h
+.env
+.env.*
+!.env.example

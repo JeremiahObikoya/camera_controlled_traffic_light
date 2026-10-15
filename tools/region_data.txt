@@ -9,8 +9,6 @@ static const Roi ROIS[] = {
 };
 
 
-//Car size
+//Max Car size
 static const int16_t CAR_Size_PTS[] = {151,124, 177,124, 177,154, 151,154};
-static const Roi ROIS[] = {
-    {"ROI 4", CAR_Size_PTS, 4},
-};
+
